@@ -1,0 +1,88 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""mkisofs 包装器：补上 macOS 版 mkisofs 缺失的 dvd+rw-tools 补丁行为。
+
+growisofs -M 调用 mkisofs 时会传 "-M -"（旧镜像从 stdin 读入）。
+原版 mkisofs 不支持 '-'，会报 "Unable to open previous session image '-'"。
+本包装器把 stdin 写入临时文件后，再以 "-M <临时文件>" 调用真正的 mkisofs。
+
+关键点：growisofs 会把自己的设备文件描述符继承给子进程。包装器必须
+在读入 stdin 后关闭所有 fd>2，否则它会一直持有 /dev/rdiskN，
+导致 growisofs 写到一半要求独占访问时报
+"unable to ObtainExclusiveAccess"（实测大文件必现）。
+"""
+import os
+import subprocess
+import sys
+import tempfile
+
+REAL_MKISOFS = "/opt/homebrew/bin/mkisofs"
+
+
+def detach_from_device():
+    """growisofs 会把光驱设备直接作为 fd 0 (stdin) 交给 mkisofs，
+    并额外继承 fd 3/4 等设备描述符。stdin 读完后必须把 fd 0 换成 /dev/null
+    并关掉其余继承 fd，否则包装器会一直持有 /dev/rdiskN，
+    导致 growisofs 写到 80% 要求独占访问时报 ObtainExclusiveAccess（实测必现）。"""
+    try:
+        devnull = os.open("/dev/null", os.O_RDONLY)
+        os.dup2(devnull, 0)
+        if devnull != 0:
+            os.close(devnull)
+    except OSError:
+        pass
+    try:
+        for name in os.listdir("/dev/fd"):
+            try:
+                fd = int(name)
+            except ValueError:
+                continue
+            if fd <= 2:
+                continue
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def main():
+    argv = sys.argv[1:]
+    out = []
+    tmp = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        out.append(a)
+        if a == "-M" and i + 1 < len(argv) and argv[i + 1] == "-":
+            t = tempfile.NamedTemporaryFile(prefix="mkisofs_stdin_", suffix=".img",
+                                            delete=False)
+            try:
+                while True:
+                    chunk = sys.stdin.buffer.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    t.write(chunk)
+            finally:
+                t.close()
+            tmp = t.name
+            out.append(tmp)
+            i += 2
+            continue
+        i += 1
+    try:
+        # 释放从 growisofs 继承的设备 fd，避免与它争夺独占访问
+        detach_from_device()
+        rc = subprocess.call([REAL_MKISOFS] + out)
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
